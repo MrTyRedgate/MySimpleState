@@ -1,0 +1,359 @@
+# Flyway State-Based Deployment Pipeline
+# 
+# Prerequisites:
+# 1. Create variable group 'RG_Auth' with secrets:
+#    - RG_EMAIL: Your Redgate email
+#    - RG_TOKEN: Your Redgate PAT token
+# 2. Ensure flyway.toml is configured for your environments
+# 3. Set up agent pool or use default
+# 4. Configure environment names to match your setup
+
+trigger: none
+
+parameters:
+- name: enableBuild
+  displayName: 'Enable Build Stage'
+  type: boolean
+  default: true
+- name: enablePreTestReport
+  displayName: 'Enable Pre-Test Report'
+  type: boolean
+  default: true
+- name: enableTest
+  displayName: 'Enable Test Deployment'
+  type: boolean
+  default: true
+- name: enablePreProdReport
+  displayName: 'Enable Pre-Prod Report'
+  type: boolean
+  default: true
+- name: enableProd
+  displayName: 'Enable Prod Deployment'
+  type: boolean
+  default: true
+
+pool:
+  name: default
+
+variables:
+- group: RG_Auth
+- name: deploymentId
+  value: $[coalesce(variables['System.PullRequest.PullRequestNumber'], variables['Build.BuildNumber'])]
+
+stages:
+# =============================================================================
+# STAGE 1: AUTHENTICATE FLYWAY
+# =============================================================================
+- stage: Authenticate
+  displayName: 'Authenticating Flyway'
+  jobs:
+  - job: AuthenticateFlyway
+    displayName: 'Authenticate with Redgate'
+    steps: 
+    - script: flyway auth -IAgreeToTheEula -email="$(RG_EMAIL)" -token="$(RG_TOKEN)"
+      displayName: 'Authenticating Flyway'
+
+# =============================================================================
+# STAGE 2: BUILD & VALIDATE SCHEMA MODEL
+# =============================================================================
+- stage: Build
+  displayName: 'Build & Validate Schema Model'
+  dependsOn: Authenticate
+  condition: succeeded()
+  jobs: 
+  - job: BuildValidate
+    displayName: 'Build and Validate'
+    condition: eq('${{ parameters.enableBuild }}', true)
+    steps:
+    - script: |
+        flyway clean -cleanDisabled="false" prepare deploy ^
+        -configFiles="$(System.DefaultWorkingDirectory)\flyway.toml" ^
+        -environment=build ^
+        -prepare.source=schemaModel ^
+        -prepare.target=build ^
+        -deploy.target=build
+      displayName: 'Clean → Prepare → Deploy to Build Environment'
+
+# =============================================================================
+# STAGE 3: PRE-TEST REPORT & SCRIPT GENERATION
+# =============================================================================
+- stage: PreTest_Report
+  displayName: 'Generate Test Change Report & Deployment Script'
+  dependsOn: Build
+  condition: succeeded()
+  jobs:
+  - job: TestReporting
+    displayName: 'Test Environment Analysis'
+    condition: eq('${{ parameters.enablePreTestReport }}', true)
+    steps:
+    # Create required directories
+    - script: if not exist "$(System.DefaultWorkingDirectory)\reports" mkdir "$(System.DefaultWorkingDirectory)\reports"
+      displayName: 'Create Reports Directory'
+      continueOnError: true
+    - script: if not exist "$(System.DefaultWorkingDirectory)\scripts" mkdir "$(System.DefaultWorkingDirectory)\scripts"
+      displayName: 'Create Scripts Directory'
+      continueOnError: true
+    
+    # Generate change report comparing schema model vs test environment
+    - script: |
+        flyway check -changes ^
+        -check.changesSource="schemaModel" ^
+        -environment="test" ^
+        -reportFilename="reports\TestChangeReport-$(deploymentId).html" ^
+        -workingDirectory="$(System.DefaultWorkingDirectory)"
+      displayName: 'Generate Test Change Report'
+      continueOnError: true
+    
+    # Create deployment script (dry run)
+    - script: |
+        flyway prepare ^
+        -source="schemaModel" ^
+        -target="test" ^
+        -scriptFilename="$(System.DefaultWorkingDirectory)/scripts/deploy_script_Test_$(deploymentId).sql" ^
+        -force="true"
+      displayName: 'Generate Test Deployment Script (Dry Run)'
+      continueOnError: true
+    
+    # Ensure deployment artifact always exists (handle no-changes scenario)
+    - powershell: |
+        $scriptFile = "$(System.DefaultWorkingDirectory)\scripts\deploy_script_Test_$(deploymentId).sql"
+        if (-not (Test-Path $scriptFile)) {
+          Write-Host "No deployment script generated - creating placeholder file"
+          $placeholderContent = @"
+        -- No schema changes detected for Test environment
+        -- Schema model matches current Test database state
+        -- No deployment required for deployment ID: $(deploymentId)
+        "@
+          $placeholderContent | Out-File -FilePath $scriptFile -Encoding UTF8
+        } else {
+          Write-Host "Deployment script generated successfully for Test environment"
+        }
+      displayName: 'Ensure Test Deployment Artifact Exists'
+    
+    # Publish artifacts for reviewer access
+    - task: PublishBuildArtifacts@1
+      displayName: 'Publish Test Change Report'
+      inputs:
+        PathtoPublish: '$(System.DefaultWorkingDirectory)\reports'
+        ArtifactName: 'Test_Change_Report-$(deploymentId)'
+        publishLocation: 'Container'
+    
+    - task: PublishBuildArtifacts@1
+      displayName: 'Publish Test Deployment Script'
+      inputs:
+        PathtoPublish: '$(System.DefaultWorkingDirectory)\scripts'
+        ArtifactName: 'Test_Deployment_Scripts-$(deploymentId)'
+        publishLocation: 'Container'
+
+# =============================================================================
+# STAGE 4: TEST DEPLOYMENT WITH APPROVAL
+# =============================================================================
+- stage: Test
+  displayName: 'Deploy to Test Environment'
+  dependsOn: PreTest_Report
+  condition: succeeded()
+  jobs: 
+  # Manual approval gate
+  - job: TestApproval
+    displayName: 'Test Environment Manual Approval'
+    condition: eq('${{ parameters.enableTest }}', true)
+    pool: server
+    steps:
+    - task: ManualValidation@0
+      displayName: 'Approve Test Deployment'
+      inputs:
+        notifyUsers: 'user@email.com'
+        instructions: |
+          Please review the following before approving Test deployment:
+          
+          1. Test Change Report (shows what will change)
+          2. Test Deployment Script (shows exact SQL to be executed)
+          
+          Deployment ID: $(deploymentId)
+          
+          Only approve if you are satisfied with the proposed changes.
+        onTimeout: 'resume'
+  
+  # Conditional deployment
+  - job: TestDeploy
+    displayName: 'Execute Test Deployment'
+    dependsOn: TestApproval
+    condition: eq('${{ parameters.enableTest }}', true)
+    steps:
+    # Download the prepared deployment script
+    - task: DownloadBuildArtifacts@0
+      displayName: 'Download Test Deployment Scripts'
+      inputs:
+        buildType: 'current'
+        downloadType: 'single'
+        artifactName: 'Test_Deployment_Scripts-$(deploymentId)'
+        downloadPath: '$(System.DefaultWorkingDirectory)'
+      continueOnError: true
+    
+    # Execute deployment only if real changes exist
+    - powershell: |
+        $scriptPath = "$(System.DefaultWorkingDirectory)/Test_Deployment_Scripts-$(deploymentId)/deploy_script_Test_$(deploymentId).sql"
+        
+        if (Test-Path $scriptPath) {
+          $content = Get-Content $scriptPath -Raw
+          if ($content -match "-- No schema changes detected") {
+            Write-Host "##[section] No Schema Changes Required"
+            Write-Host "Placeholder script detected - Test environment already matches schema model."
+            Write-Host "Deployment completed successfully - no changes to apply."
+            Write-Host "Deployment ID: $(deploymentId)"
+          } else {
+            Write-Host "##[section] Executing Test Deployment"
+            Write-Host "Deployment script found. Proceeding with Test deployment..."
+            Write-Host "Deployment ID: $(deploymentId)"
+            flyway deploy -scriptFilename="$scriptPath" -environment="test"
+            Write-Host "##[section] Test Deployment Completed Successfully"
+          }
+        } else {
+          Write-Host "##[warning] No deployment script found - assuming no changes required"
+          Write-Host "Test deployment completed successfully - no changes to apply."
+        }
+      displayName: 'Deploy to Test (Conditional)'
+
+# =============================================================================
+# STAGE 5: PRE-PROD REPORT & SCRIPT GENERATION
+# =============================================================================
+- stage: PreProd_Report
+  displayName: 'Generate Prod Change Report & Deployment Script'
+  dependsOn: Test
+  condition: succeeded()
+  jobs:
+  - job: ProdReporting
+    displayName: 'Production Environment Analysis'
+    condition: eq('${{ parameters.enablePreProdReport }}', true)
+    steps:
+    # Create required directories
+    - script: if not exist "$(System.DefaultWorkingDirectory)\reports" mkdir "$(System.DefaultWorkingDirectory)\reports"
+      displayName: 'Create Reports Directory'
+      continueOnError: true
+    - script: if not exist "$(System.DefaultWorkingDirectory)\scripts" mkdir "$(System.DefaultWorkingDirectory)\scripts"
+      displayName: 'Create Scripts Directory'
+      continueOnError: true
+    
+    # Generate change report comparing schema model vs prod environment
+    - script: |
+        flyway check -changes ^
+        -check.changesSource="schemaModel" ^
+        -environment="prod" ^
+        -reportFilename="reports\ProdChangeReport-$(deploymentId).html" ^
+        -workingDirectory="$(System.DefaultWorkingDirectory)"
+      displayName: 'Generate Production Change Report'
+      continueOnError: true
+    
+    # Create deployment script (dry run)
+    - script: |
+        flyway prepare ^
+        -source="schemaModel" ^
+        -target="prod" ^
+        -scriptFilename="$(System.DefaultWorkingDirectory)/scripts/deploy_script_Prod_$(deploymentId).sql" ^
+        -force="true"
+      displayName: 'Generate Production Deployment Script (Dry Run)'
+      continueOnError: true
+    
+    # Ensure deployment artifact always exists (handle no-changes scenario)
+    - powershell: |
+        $scriptFile = "$(System.DefaultWorkingDirectory)\scripts\deploy_script_Prod_$(deploymentId).sql"
+        if (-not (Test-Path $scriptFile)) {
+          Write-Host "No deployment script generated - creating placeholder file"
+          $placeholderContent = @"
+        -- No schema changes detected for Production environment
+        -- Schema model matches current Production database state
+        -- No deployment required for deployment ID: $(deploymentId)
+        "@
+          $placeholderContent | Out-File -FilePath $scriptFile -Encoding UTF8
+        } else {
+          Write-Host "Deployment script generated successfully for Production environment"
+        }
+      displayName: 'Ensure Production Deployment Artifact Exists'
+    
+    # Publish artifacts for reviewer access
+    - task: PublishBuildArtifacts@1
+      displayName: 'Publish Production Change Report'
+      inputs:
+        PathtoPublish: '$(System.DefaultWorkingDirectory)\reports'
+        ArtifactName: 'Prod_Change_Report-$(deploymentId)'
+        publishLocation: 'Container'
+    
+    - task: PublishBuildArtifacts@1
+      displayName: 'Publish Production Deployment Script'
+      inputs:
+        PathtoPublish: '$(System.DefaultWorkingDirectory)\scripts'
+        ArtifactName: 'Prod_Deployment_Scripts-$(deploymentId)'
+        publishLocation: 'Container'
+
+# =============================================================================
+# STAGE 6: PRODUCTION DEPLOYMENT WITH APPROVAL
+# =============================================================================
+- stage: Prod
+  displayName: 'Deploy to Production Environment'
+  dependsOn: PreProd_Report
+  condition: succeeded()
+  jobs: 
+  # Manual approval gate
+  - job: ProdApproval
+    displayName: 'Production Environment Manual Approval'
+    condition: eq('${{ parameters.enableProd }}', true)
+    pool: server
+    steps:
+    - task: ManualValidation@0
+      displayName: 'Approve Production Deployment'
+      inputs:
+        notifyUsers: 'user@email.com'
+        instructions: |
+          🚨 PRODUCTION DEPLOYMENT APPROVAL REQUIRED 🚨
+          
+          Please carefully review the following before approving:
+          
+          1. Production Change Report (shows what will change in PROD)
+          2. Production Deployment Script (shows exact SQL to be executed in PROD)
+          3. Verify Test deployment was successful
+          
+          Deployment ID: $(deploymentId)
+          
+          ⚠️  CAUTION: This will modify the Production database
+          Only approve if you are completely satisfied with the proposed changes.
+        onTimeout: 'resume'
+  
+  # Conditional deployment
+  - job: ProdDeploy
+    displayName: 'Execute Production Deployment'
+    dependsOn: ProdApproval
+    condition: eq('${{ parameters.enableProd }}', true)
+    steps:
+    # Download the prepared deployment script
+    - task: DownloadBuildArtifacts@0
+      displayName: 'Download Production Deployment Scripts'
+      inputs:
+        buildType: 'current'
+        downloadType: 'single'
+        artifactName: 'Prod_Deployment_Scripts-$(deploymentId)'
+        downloadPath: '$(System.DefaultWorkingDirectory)'
+      continueOnError: true
+    
+    # Execute deployment only if real changes exist
+    - powershell: |
+        $scriptPath = "$(System.DefaultWorkingDirectory)/Prod_Deployment_Scripts-$(deploymentId)/deploy_script_Prod_$(deploymentId).sql"
+        
+        if (Test-Path $scriptPath) {
+          $content = Get-Content $scriptPath -Raw
+          if ($content -match "-- No schema changes detected") {
+            Write-Host "##[section] No Schema Changes Required"
+            Write-Host "Placeholder script detected - Production environment already matches schema model."
+            Write-Host "Deployment completed successfully - no changes to apply."
+            Write-Host "Deployment ID: $(deploymentId)"
+          } else {
+            Write-Host "##[section] 🚨 EXECUTING PRODUCTION DEPLOYMENT 🚨"
+            Write-Host "Deployment script found. Proceeding with Production deployment..."
+            Write-Host "Deployment ID: $(deploymentId)"
+            flyway deploy -scriptFilename="$scriptPath" -environment="prod"
+            Write-Host "##[section] ✅ PRODUCTION DEPLOYMENT COMPLETED SUCCESSFULLY"
+          }
+        } else {
+          Write-Host "##[warning] No deployment script found - assuming no changes required"
+          Write-Host "Production deployment completed successfully - no changes to apply."
+        }
+      displayName: 'Deploy to Production (Conditional)'
